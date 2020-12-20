@@ -1,29 +1,150 @@
 'use strict';
 
+const { server } = require("sinon");
+
 const serial = {
-    connected:      false,
-    connectionId:   false,
-    openCanceled:   false,
-    bitrate:        0,
-    bytesReceived:  0,
-    bytesSent:      0,
-    failed:         0,
-    connectionType: 'serial', // 'serial' or 'tcp'
-    connectionIP:   '127.0.0.1',
+    connected: false,
+    connectionId: false,
+    openCanceled: false,
+    bitrate: 0,
+    bytesReceived: 0,
+    bytesSent: 0,
+    failed: 0,
+    connectionType: 'serial', // 'serial' or 'tcp' or 'bluetooth'
+    connectionIP: '127.0.0.1',
     connectionPort: 5761,
 
-    transmitting:   false,
-    outputBuffer:   [],
+    transmitting: false,
+    outputBuffer: [],
 
     connect: function (path, options, callback) {
         const self = this;
         const testUrl = path.match(/^tcp:\/\/([A-Za-z0-9\.-]+)(?:\:(\d+))?$/);
         if (testUrl) {
             self.connectTcp(testUrl[1], testUrl[2], options, callback);
+        } else if(path === 'Bluetooth') {
+            self.connectBluetooth(options, callback)
         } else {
             self.connectSerial(path, options, callback);
         }
     },
+
+    connectBluetooth: function(options, callback) {
+        navigator.bluetooth.requestDevice({
+            optionalServices: ['00001000-0000-1000-8000-00805f9b34fb'],
+            acceptAllDevices: true
+        }).then(device => {
+            console.log('Requested ' + device.name + ' (' + device.id + ')');
+            serial.connectBluetoothDevice(device, callback);
+        }).catch(error => {
+            console.log('Bluetooth error ' + error);
+            callback(false);
+        });
+    },
+
+    connectBluetoothDevice: function (device, callback) {
+        const self = this;
+        self.connectionType = 'bluetooth';
+        self.connectionId = 'bluetooth';
+        self.bitrate = 19200;
+        self.bytesReceived = 0;
+        self.bytesSent = 0;
+        self.failed = 0;
+
+        const doConnect = () => device.gatt.connect()
+            .then(server => server.getPrimaryService('00001000-0000-1000-8000-00805f9b34fb'))
+            .then(service => service.getCharacteristics())
+            .then(characteristics => {
+                const sendSerial = characteristics
+                    .filter(c => c.uuid.startsWith('00001001') && c.properties.writeWithoutResponse)[0]
+                const receiveSerial = characteristics
+                    .filter(c => c.uuid.startsWith('00001002') && c.properties.notify)[0];
+
+                if (!sendSerial || !receiveSerial) {
+                    return Promise.reject(new Error("Can't find characteristics"));
+                }
+                return [sendSerial, receiveSerial];
+            })
+            .then(([sendSerial, receiveSerial]) => {
+                receiveSerial.addEventListener('characteristicvaluechanged', event => {
+                    //console.log('Got BLE packet: ');
+                    self.onReceive.listeners.forEach(listener => listener({
+                        connectionId: self.connectionId,
+                        connectionType: 'bluetooth',
+                        data: event.target.value.buffer,
+                        resultCode: 0,
+                    }));
+                });
+                return receiveSerial.startNotifications()
+                    .then(ignore => [ sendSerial, receiveSerial ]);
+            })
+            .then(([sendSerial, receiveSerial]) => {
+                self.bluetoothSend = (connectionId, data, callback) => {
+                    const maxLength = 20;
+                    const doSend = (data) => {
+                        const [sending, rest] = data.byteLength <= maxLength ? 
+                            [data, null] : [data.slice(0, maxLength), data.slice(maxLength)];
+
+                            sendSerial.writeValue(new Uint8Array(sending))
+                            .then(() => {
+                                if (rest) {
+                                    return doSend(rest);
+                                }
+                                
+                                callback({
+                                    connectionId: self.connectionId,
+                                    connectionType: 'bluetooth',
+                                    resultCode: 0,
+                                    bytesSent: sending.byteLength
+                                });
+                            })
+                            .catch(error => {
+                                console.error(error);
+                                callback({
+                                    resultCode: -1,
+                                    bytesSent: 0,
+                                    error: 'Bluetooth error ' + error
+                                });
+                            });
+                    }
+
+                    doSend(data);
+                };
+                self.bluetoothDisconnect = (connectionId, callback) => {
+                    receiveSerial.stopNotifications()
+                        .then(() => device.gatt.disconnect())
+                        .then(() => {
+                            callback(true);
+                        })
+                        .catch(error => callback(false));
+                }
+            });
+           
+        device.addEventListener('gattserverdisconnected', () => {
+            console.error('Disconnected Bluetooth device ' + device.name);
+            if (self.connected) {
+                console.info('Attempting reconnect');
+                doConnect()
+                    .then(() => console.log('Reconnected to ' + device.name));
+            }
+        });
+        
+        doConnect()
+            .then(() => {
+                self.connected = true;
+
+                if (callback) {
+                    callback({connected: true})
+                }
+            })
+            .catch(error => {
+                if (callback) {
+                    console.error(error);
+                    callback(false);
+                }
+            });
+    },
+
     connectSerial: function (path, options, callback) {
         const self = this;
         self.connectionType = 'serial';
@@ -67,8 +188,8 @@ const serial = {
                         case 'overrun':
                             // wait 50 ms and attempt recovery
                             self.error = info.error;
-                            setTimeout(function() {
-                                chrome.serial.setPaused(info.connectionId, false, function() {
+                            setTimeout(function () {
+                                chrome.serial.setPaused(info.connectionId, false, function () {
                                     self.getInfo(function (_info) {
                                         if (_info) {
                                             if (_info.paused) {
@@ -150,7 +271,7 @@ const serial = {
             persistent: false,
             name: 'Betaflight',
             bufferSize: 65535,
-        }, function(createInfo) {
+        }, function (createInfo) {
             if (createInfo && !self.openCanceled || !self.checkChromeRunTimeError()) {
                 self.connectionId = createInfo.socketId;
                 self.bitrate = 115200; // fake
@@ -189,6 +310,7 @@ const serial = {
             }
         });
     },
+
     disconnect: function (callback) {
         const self = this;
         self.connected = false;
@@ -211,7 +333,12 @@ const serial = {
                 });
             }
 
-            const disconnectFn = (self.connectionType === 'serial') ? chrome.serial.disconnect : chrome.sockets.tcp.close;
+            const disconnectFn = {
+                'serial': chrome.serial.disconnect,
+                'tcp': chrome.sockets.tcp.close,
+                'bluetooth': self.bluetoothDisconnect
+            }[serial.connectionType];
+
             disconnectFn(self.connectionId, function (result) {
                 self.checkChromeRunTimeError();
 
@@ -234,10 +361,17 @@ const serial = {
             const devices = [];
             devices_array.forEach(function (device) {
                 devices.push({
-                              path: device.path,
-                              displayName: device.displayName,
-                             });
+                    path: device.path,
+                    displayName: device.displayName,
+                });
             });
+
+            if (navigator.bluetooth) {
+                devices.push({
+                    path: 'Bluetooth',
+                    displayName: 'Bluetooth'
+                });
+            }
 
             callback(devices);
         });
@@ -246,9 +380,14 @@ const serial = {
         const chromeType = (this.connectionType === 'serial') ? chrome.serial : chrome.sockets.tcp;
         chromeType.getInfo(this.connectionId, callback);
     },
+    sendFn: () => ({
+        'serial': chrome.serial.send,
+        'tcp': chrome.sockets.tcp.send,
+        'bluetooth': serial.bluetoothSend
+    }[serial.connectionType]),
     send: function (data, callback) {
         const self = this;
-        self.outputBuffer.push({'data': data, 'callback': callback});
+        self.outputBuffer.push({ 'data': data, 'callback': callback });
 
         function _send() {
             // store inside separate variables in case array gets destroyed
@@ -266,7 +405,7 @@ const serial = {
                 return;
             }
 
-            const sendFn = (self.connectionType === 'serial') ? chrome.serial.send : chrome.sockets.tcp.send;
+            const sendFn = self.sendFn();
             sendFn(self.connectionId, _data, function (sendInfo) {
                 self.checkChromeRunTimeError();
 
@@ -323,16 +462,24 @@ const serial = {
             _send();
         }
     },
+    chromeType: () => ({
+        'serial': chrome.serial,
+        'tcp': chrome.sockets.tcp,
+        'bluetooth': { 
+            onReceive: { addListener: () => {}, removeListener: () => {} },
+            onReceiveError: { addListener: () => {}, removeListener: () => {} },
+        },
+    }[serial.connectionType]),
     onReceive: {
         listeners: [],
 
         addListener: function (function_reference) {
-            const chromeType = (serial.connectionType === 'serial') ? chrome.serial : chrome.sockets.tcp;
+            const chromeType = serial.chromeType();
             chromeType.onReceive.addListener(function_reference);
             this.listeners.push(function_reference);
         },
         removeListener: function (function_reference) {
-            const chromeType = (serial.connectionType === 'serial') ? chrome.serial : chrome.sockets.tcp;
+            const chromeType = serial.chromeType();
             for (let i = (this.listeners.length - 1); i >= 0; i--) {
                 if (this.listeners[i] == function_reference) {
                     chromeType.onReceive.removeListener(function_reference);
@@ -347,12 +494,12 @@ const serial = {
         listeners: [],
 
         addListener: function (function_reference) {
-            const chromeType = (serial.connectionType === 'serial') ? chrome.serial : chrome.sockets.tcp;
+            const chromeType = serial.chromeType();
             chromeType.onReceiveError.addListener(function_reference);
             this.listeners.push(function_reference);
         },
         removeListener: function (function_reference) {
-            const chromeType = (serial.connectionType === 'serial') ? chrome.serial : chrome.sockets.tcp;
+            const chromeType = serial.chromeType();
             for (let i = (this.listeners.length - 1); i >= 0; i--) {
                 if (this.listeners[i] == function_reference) {
                     chromeType.onReceiveError.removeListener(function_reference);
@@ -376,7 +523,7 @@ const serial = {
 
         let message = 'error: UNDEFINED';
         if (self.connectionType === 'tcp') {
-            switch (result){
+            switch (result) {
                 case -15:
                     // connection is lost, cannot write to it anymore, preventing further disconnect attempts
                     message = 'error: ERR_SOCKET_NOT_CONNECTED';
